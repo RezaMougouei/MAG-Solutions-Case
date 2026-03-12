@@ -46,7 +46,8 @@ def _mb(path: Path) -> float:
 def _optimize_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     for col in df.select_dtypes(include="float64").columns:
         df[col] = df[col].astype("float32")
-    for col in ["EID", "MONTH", "SCENARIOID"]:
+    # NOTE: MONTH kept as string for comparison — do NOT categorize it
+    for col in ["EID", "SCENARIOID"]:
         if col in df.columns:
             df[col] = df[col].astype("category")
     return df
