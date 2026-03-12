@@ -103,8 +103,8 @@ def run_backtest(start_month: str, end_month: str, target_k: int = 50):
     lookback_years = sorted(set(all_years + [min(all_years) - 1]))
 
     print(f"[INFO] Loading data for years {lookback_years}...")
-    costs_df      = load_costs(years=lookback_years)
-    prices_df     = load_prices(years=lookback_years)
+    costs_df  = load_costs()
+    prices_df = load_prices()
     sim_monthly_df = load_sim_monthly(years=lookback_years)
     sim_daily_df   = load_sim_daily(years=lookback_years)
 
