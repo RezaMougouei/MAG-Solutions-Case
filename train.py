@@ -1,19 +1,20 @@
 """
 train.py
 --------
-Optimized training pipeline with detailed live progress tracking.
+Memory-efficient training pipeline.
 
-Shows:
-  - Stage-by-stage timing and memory
-  - Per-month dataset build progress with ETA
-  - Per-fold results printed live as they complete
-  - Rolling average metrics across folds
-  - Final summary table
+Core strategy: process ONE YEAR of sim data at a time.
+- Load sim_monthly for year Y (~2-3 GB)
+- Build features for all months in year Y
+- Discard sim data
+- Move to year Y+1
+
+This keeps peak memory to ~3-4 GB instead of 10+ GB.
 
 Usage:
     python train.py --start-month 2020-01 --end-month 2023-12 --model lightgbm
     python train.py --start-month 2020-01 --end-month 2023-12 --model logistic
-    python train.py --start-month 2020-01 --end-month 2023-12 --model xgboost --smote
+    python train.py --start-month 2020-01 --end-month 2023-12 --model xgboost
 """
 
 import argparse
@@ -25,7 +26,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from data_loader import load_costs, load_prices, load_sim_monthly, load_sim_daily
+from data_loader import (
+    load_costs, load_prices,
+    load_sim_monthly_year, load_sim_daily_year,
+)
 from profitability import compute_profitability
 from feature_builder import build_feature_matrix
 from models import (
@@ -34,70 +38,120 @@ from models import (
     apply_smote, tune_threshold, evaluate_model,
 )
 from main import month_range, prev_month, years_needed
-from progress import (
-    StageTimer, PipelineProgress, DatasetBuildProgress, get_memory_mb
-)
+from progress import StageTimer, PipelineProgress, DatasetBuildProgress, get_memory_mb
 
 MIN_K = 10
 MAX_K = 100
 
 
 # ---------------------------------------------------------------------------
-# Build full dataset ONCE with live progress
+# Build dataset YEAR BY YEAR — never more than ~3GB in memory at once
 # ---------------------------------------------------------------------------
 
-def build_full_dataset(
+def build_full_dataset_by_year(
     all_months: list[str],
-    sim_monthly_df: pd.DataFrame,
-    sim_daily_df: pd.DataFrame,
     hist_profit_df: pd.DataFrame,
     lookback_months: int = 6,
 ) -> pd.DataFrame:
+    """
+    Build full labeled feature matrix processing ONE year of sim data at a time.
 
-    progress = DatasetBuildProgress(total_months=len(all_months))
-    frames   = []
+    For each year:
+      1. Load sim_monthly_year  (~2-3 GB)
+      2. Load sim_daily_year    (~1-2 GB)
+      3. Build features for all months in that year
+      4. Delete sim data → back to baseline memory
+      5. Move to next year
+    """
+    # Group months by their decision year
+    # e.g. target_month=2021-03 → decision_month=2021-02 → decision_year=2021
+    year_to_months: dict[int, list[str]] = {}
+    for tm in all_months:
+        dm   = prev_month(tm)
+        year = int(dm[:4])
+        year_to_months.setdefault(year, []).append(tm)
 
-    for target_month in all_months:
-        decision_month = prev_month(target_month)
-        cutoff_dt      = pd.Timestamp(f"{decision_month}-08 00:00:00")
+    all_years = sorted(year_to_months.keys())
+    total_months = len(all_months)
+    progress = DatasetBuildProgress(total_months=total_months)
+    all_frames = []
 
-        sm_allowed   = sim_monthly_df[sim_monthly_df["MONTH"] <= target_month]
-        sd_allowed   = sim_daily_df[sim_daily_df["DATETIME"] <= cutoff_dt]
-        hist_allowed = hist_profit_df[hist_profit_df["MONTH"] <= decision_month]
+    for year in all_years:
+        months_this_year = year_to_months[year]
 
-        fm = build_feature_matrix(
-            sm_allowed, sd_allowed, hist_allowed,
-            target_month=target_month,
-            decision_month=decision_month,
-            lookback_months=lookback_months,
-        )
-        if fm.empty:
-            progress.update(target_month, 0, 0)
+        print(f"\n  ── Year {year} "
+              f"({len(months_this_year)} months | mem={get_memory_mb():.0f} MB) ──")
+
+        # Load sim data for this year only
+        with StageTimer(f"  sim_monthly {year}"):
+            sim_monthly_df = load_sim_monthly_year(year)
+
+        with StageTimer(f"  sim_daily {year}"):
+            sim_daily_df = load_sim_daily_year(year)
+
+        if sim_monthly_df.empty:
+            print(f"  [WARN] No sim_monthly data for {year}, skipping.")
+            del sim_monthly_df, sim_daily_df
+            gc.collect()
             continue
 
-        truth = hist_profit_df[
-            hist_profit_df["MONTH"] == target_month
-        ][["EID", "PEAKID", "IS_PROFITABLE", "PROFIT"]].copy()
+        # Build features for each month in this year
+        for target_month in months_this_year:
+            decision_month = prev_month(target_month)
+            cutoff_dt      = pd.Timestamp(f"{decision_month}-08 00:00:00")
 
-        fm["EID"]    = fm["EID"].astype(str)
-        truth["EID"] = truth["EID"].astype(str)
+            sm_allowed   = sim_monthly_df[sim_monthly_df["MONTH"] <= target_month]
+            sd_allowed   = sim_daily_df[sim_daily_df["DATETIME"] <= cutoff_dt] \
+                           if not sim_daily_df.empty else pd.DataFrame()
+            hist_allowed = hist_profit_df[hist_profit_df["MONTH"] <= decision_month]
 
-        fm = fm.merge(truth, on=["EID", "PEAKID"], how="left")
-        fm["IS_PROFITABLE"] = fm["IS_PROFITABLE"].fillna(False).astype(int)
-        fm["PROFIT"]        = fm["PROFIT"].fillna(0.0)
-        fm["TARGET_MONTH"]  = target_month
+            fm = build_feature_matrix(
+                sm_allowed, sd_allowed, hist_allowed,
+                target_month=target_month,
+                decision_month=decision_month,
+                lookback_months=lookback_months,
+            )
 
-        progress.update(target_month, len(fm), int(fm["IS_PROFITABLE"].sum()))
-        frames.append(fm)
+            if fm.empty:
+                progress.update(target_month, 0, 0)
+                continue
 
-    if not frames:
+            # Attach ground truth labels
+            truth = hist_profit_df[
+                hist_profit_df["MONTH"] == target_month
+            ][["EID", "PEAKID", "IS_PROFITABLE", "PROFIT"]].copy()
+
+            fm["EID"]    = fm["EID"].astype(str)
+            truth["EID"] = truth["EID"].astype(str)
+
+            fm = fm.merge(truth, on=["EID", "PEAKID"], how="left")
+            fm["IS_PROFITABLE"] = fm["IS_PROFITABLE"].fillna(False).astype(int)
+            fm["PROFIT"]        = fm["PROFIT"].fillna(0.0)
+            fm["TARGET_MONTH"]  = target_month
+
+            progress.update(target_month, len(fm), int(fm["IS_PROFITABLE"].sum()))
+            all_frames.append(fm)
+
+        # Discard sim data immediately — back to baseline memory
+        del sim_monthly_df, sim_daily_df
+        gc.collect()
+        print(f"  Sim data freed | mem={get_memory_mb():.0f} MB")
+
+    if not all_frames:
         return pd.DataFrame()
 
-    full_df  = pd.concat(frames, ignore_index=True)
+    print(f"\n  Concatenating {len(all_frames)} monthly frames...",
+          end=" ", flush=True)
+    t0      = time.perf_counter()
+    full_df = pd.concat(all_frames, ignore_index=True)
+    print(f"{time.perf_counter()-t0:.1f}s")
+
     pos_rate = full_df["IS_PROFITABLE"].mean() * 100
-    print(f"\n  Dataset complete: {full_df.shape[0]:,} rows | "
+    print(f"  Dataset: {full_df.shape[0]:,} rows | "
           f"{pos_rate:.2f}% profitable | "
-          f"{full_df['TARGET_MONTH'].nunique()} months")
+          f"{full_df['TARGET_MONTH'].nunique()} months | "
+          f"mem={get_memory_mb():.0f} MB")
+
     return full_df
 
 
@@ -130,7 +184,7 @@ def select_from_model(
 
 
 # ---------------------------------------------------------------------------
-# Walk-forward training
+# Main training pipeline
 # ---------------------------------------------------------------------------
 
 def run_training(
@@ -145,19 +199,18 @@ def run_training(
 ) -> tuple:
 
     all_months = month_range(start_month, end_month)
-    all_years  = years_needed(all_months + [prev_month(m) for m in all_months])
     n_folds    = len(all_months) - min_train_months
 
     print(f"\n{'='*60}")
     print(f"  MAG Energy — Training Pipeline")
     print(f"  Model:  {model_type.upper()}")
     print(f"  Range:  {start_month} → {end_month}")
-    print(f"  Folds:  {n_folds}")
+    print(f"  Months: {len(all_months)} | Folds: {n_folds}")
     print(f"  Memory: {get_memory_mb():.0f} MB at start")
     print(f"{'='*60}")
 
     # ------------------------------------------------------------------
-    # Stage 1: Load data
+    # Stage 1: Load costs + prices (small files, keep in memory)
     # ------------------------------------------------------------------
     with StageTimer("Loading costs & prices"):
         costs_df  = load_costs()
@@ -168,24 +221,13 @@ def run_training(
         del prices_df
         gc.collect()
 
-    with StageTimer(f"Loading sim_monthly {all_years}"):
-        sim_monthly_df = load_sim_monthly(years=all_years)
-
-    with StageTimer(f"Loading sim_daily {all_years}"):
-        sim_daily_df = load_sim_daily(years=all_years)
-
     # ------------------------------------------------------------------
-    # Stage 2: Build full dataset ONCE
+    # Stage 2: Build dataset year by year
     # ------------------------------------------------------------------
-    with StageTimer(f"Building feature dataset ({len(all_months)} months)",
-                    total=len(all_months)):
-        full_df = build_full_dataset(
-            all_months, sim_monthly_df, sim_daily_df,
-            hist_profit_df, lookback_months
+    with StageTimer(f"Building feature dataset ({len(all_months)} months)"):
+        full_df = build_full_dataset_by_year(
+            all_months, hist_profit_df, lookback_months
         )
-
-    del sim_monthly_df, sim_daily_df
-    gc.collect()
 
     if full_df.empty:
         print("[ERROR] Empty dataset — check data paths.")
@@ -195,9 +237,9 @@ def run_training(
     print(f"\n  Features ({len(feat_cols)}): {feat_cols}")
 
     # ------------------------------------------------------------------
-    # Stage 3: Walk-forward training
+    # Stage 3: Walk-forward training — pure in-memory slicing
     # ------------------------------------------------------------------
-    pipeline = PipelineProgress(total_folds=n_folds, model_type=model_type)
+    pipeline       = PipelineProgress(total_folds=n_folds, model_type=model_type)
     all_selections = []
     final_model    = None
     final_threshold = 0.3
@@ -213,15 +255,14 @@ def run_training(
 
         pipeline.start_fold(fold_idx, len(train_months), val_month)
 
-        # O(1) slices
         train_df = full_df[full_df["TARGET_MONTH"].isin(set(train_months))]
         val_df   = full_df[full_df["TARGET_MONTH"] == val_month]
 
         if train_df.empty or train_df["IS_PROFITABLE"].sum() < 5:
-            print(f"       ⚠ Skipped — insufficient positive samples in train")
+            print(f"       ⚠ Skipped — not enough positive samples")
             continue
         if val_df.empty or val_df["IS_PROFITABLE"].nunique() < 2:
-            print(f"       ⚠ Skipped — val month has only one class")
+            print(f"       ⚠ Skipped — single class in validation")
             continue
 
         X_train = train_df[feat_cols].fillna(0).values.astype(np.float32)
@@ -248,7 +289,6 @@ def run_training(
         metrics   = evaluate_model(
             model, X_val, y_val, threshold=threshold, label=val_month
         )
-
         pipeline.end_fold(metrics)
 
         val_features = val_df[feat_cols + ["EID", "PEAKID"]].copy()
@@ -260,9 +300,6 @@ def run_training(
         final_model     = model
         final_threshold = threshold
 
-    # ------------------------------------------------------------------
-    # Final summary
-    # ------------------------------------------------------------------
     pipeline.print_final_summary()
 
     if save_model and final_model is not None:
