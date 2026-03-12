@@ -1,17 +1,14 @@
 """
 train.py
 --------
-Optimized training pipeline — O(n) instead of O(n²).
+Optimized training pipeline with detailed live progress tracking.
 
-Key fix: build the full labeled feature matrix ONCE across all months,
-then slice train/val windows from it in memory. No redundant recomputation.
-
-Walk-Forward Cross-Validation (Time Series Split)
---------------------------------------------------
-For each fold i:
-  - Train on rows where MONTH in all_months[:i]
-  - Validate on rows where MONTH == all_months[i]
-  - Anti-leakage enforced at feature level inside build_feature_matrix.
+Shows:
+  - Stage-by-stage timing and memory
+  - Per-month dataset build progress with ETA
+  - Per-fold results printed live as they complete
+  - Rolling average metrics across folds
+  - Final summary table
 
 Usage:
     python train.py --start-month 2020-01 --end-month 2023-12 --model lightgbm
@@ -27,7 +24,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
 from data_loader import load_costs, load_prices, load_sim_monthly, load_sim_daily
 from profitability import compute_profitability
@@ -38,13 +34,16 @@ from models import (
     apply_smote, tune_threshold, evaluate_model,
 )
 from main import month_range, prev_month, years_needed
+from progress import (
+    StageTimer, PipelineProgress, DatasetBuildProgress, get_memory_mb
+)
 
 MIN_K = 10
 MAX_K = 100
 
 
 # ---------------------------------------------------------------------------
-# Build full dataset ONCE — O(n)
+# Build full dataset ONCE with live progress
 # ---------------------------------------------------------------------------
 
 def build_full_dataset(
@@ -54,16 +53,11 @@ def build_full_dataset(
     hist_profit_df: pd.DataFrame,
     lookback_months: int = 6,
 ) -> pd.DataFrame:
-    """
-    Build labeled feature matrix for ALL months in a single pass.
-    Each row = one (EID, TARGET_MONTH, PEAKID) with IS_PROFITABLE label.
 
-    Anti-leakage is enforced inside build_feature_matrix per month —
-    each month only sees data available at its decision time.
-    """
-    frames = []
+    progress = DatasetBuildProgress(total_months=len(all_months))
+    frames   = []
 
-    for target_month in tqdm(all_months, desc="Building dataset"):
+    for target_month in all_months:
         decision_month = prev_month(target_month)
         cutoff_dt      = pd.Timestamp(f"{decision_month}-08 00:00:00")
 
@@ -78,9 +72,9 @@ def build_full_dataset(
             lookback_months=lookback_months,
         )
         if fm.empty:
+            progress.update(target_month, 0, 0)
             continue
 
-        # Attach ground truth
         truth = hist_profit_df[
             hist_profit_df["MONTH"] == target_month
         ][["EID", "PEAKID", "IS_PROFITABLE", "PROFIT"]].copy()
@@ -92,14 +86,16 @@ def build_full_dataset(
         fm["IS_PROFITABLE"] = fm["IS_PROFITABLE"].fillna(False).astype(int)
         fm["PROFIT"]        = fm["PROFIT"].fillna(0.0)
         fm["TARGET_MONTH"]  = target_month
+
+        progress.update(target_month, len(fm), int(fm["IS_PROFITABLE"].sum()))
         frames.append(fm)
 
     if not frames:
         return pd.DataFrame()
 
-    full_df = pd.concat(frames, ignore_index=True)
+    full_df  = pd.concat(frames, ignore_index=True)
     pos_rate = full_df["IS_PROFITABLE"].mean() * 100
-    print(f"\n[INFO] Full dataset: {full_df.shape[0]:,} rows | "
+    print(f"\n  Dataset complete: {full_df.shape[0]:,} rows | "
           f"{pos_rate:.2f}% profitable | "
           f"{full_df['TARGET_MONTH'].nunique()} months")
     return full_df
@@ -117,7 +113,6 @@ def select_from_model(
     feat_cols: list[str],
     target_k: int = 50,
 ) -> pd.DataFrame:
-    """Select 10-100 opportunities ranked by predicted probability."""
     X     = feature_matrix[feat_cols].fillna(0).values.astype(np.float32)
     proba = model.predict_proba(X)[:, 1]
 
@@ -135,7 +130,7 @@ def select_from_model(
 
 
 # ---------------------------------------------------------------------------
-# Walk-forward — O(n) slicing from pre-built dataset
+# Walk-forward training
 # ---------------------------------------------------------------------------
 
 def run_training(
@@ -151,68 +146,82 @@ def run_training(
 
     all_months = month_range(start_month, end_month)
     all_years  = years_needed(all_months + [prev_month(m) for m in all_months])
+    n_folds    = len(all_months) - min_train_months
+
+    print(f"\n{'='*60}")
+    print(f"  MAG Energy — Training Pipeline")
+    print(f"  Model:  {model_type.upper()}")
+    print(f"  Range:  {start_month} → {end_month}")
+    print(f"  Folds:  {n_folds}")
+    print(f"  Memory: {get_memory_mb():.0f} MB at start")
+    print(f"{'='*60}")
 
     # ------------------------------------------------------------------
-    # Load data once
+    # Stage 1: Load data
     # ------------------------------------------------------------------
-    print("[INFO] Loading costs and prices...")
-    costs_df  = load_costs()
-    prices_df = load_prices()
+    with StageTimer("Loading costs & prices"):
+        costs_df  = load_costs()
+        prices_df = load_prices()
 
-    print("[INFO] Computing historical profitability...")
-    hist_profit_df = compute_profitability(prices_df, costs_df)
-    del prices_df
-    gc.collect()
+    with StageTimer("Computing historical profitability"):
+        hist_profit_df = compute_profitability(prices_df, costs_df)
+        del prices_df
+        gc.collect()
 
-    print(f"[INFO] Loading sim_monthly for {all_years}...")
-    sim_monthly_df = load_sim_monthly(years=all_years)
+    with StageTimer(f"Loading sim_monthly {all_years}"):
+        sim_monthly_df = load_sim_monthly(years=all_years)
 
-    print(f"[INFO] Loading sim_daily for {all_years}...")
-    sim_daily_df = load_sim_daily(years=all_years)
+    with StageTimer(f"Loading sim_daily {all_years}"):
+        sim_daily_df = load_sim_daily(years=all_years)
 
     # ------------------------------------------------------------------
-    # Build full dataset ONCE
+    # Stage 2: Build full dataset ONCE
     # ------------------------------------------------------------------
-    t0      = time.perf_counter()
-    full_df = build_full_dataset(
-        all_months, sim_monthly_df, sim_daily_df,
-        hist_profit_df, lookback_months
-    )
-    print(f"[INFO] Dataset built in {time.perf_counter()-t0:.1f}s")
+    with StageTimer(f"Building feature dataset ({len(all_months)} months)",
+                    total=len(all_months)):
+        full_df = build_full_dataset(
+            all_months, sim_monthly_df, sim_daily_df,
+            hist_profit_df, lookback_months
+        )
 
-    # Free sim data — not needed anymore
     del sim_monthly_df, sim_daily_df
     gc.collect()
 
     if full_df.empty:
-        print("[ERROR] Empty dataset.")
+        print("[ERROR] Empty dataset — check data paths.")
         return None, 0.3, pd.DataFrame()
 
     feat_cols = get_available_features(full_df)
-    print(f"[INFO] {len(feat_cols)} features: {feat_cols}\n")
+    print(f"\n  Features ({len(feat_cols)}): {feat_cols}")
 
     # ------------------------------------------------------------------
-    # Walk-forward loop — just array slicing, no recomputation
+    # Stage 3: Walk-forward training
     # ------------------------------------------------------------------
-    n_folds = len(all_months) - min_train_months
-    print(f"[INFO] Walk-forward ({model_type}) | {n_folds} folds\n")
-
-    all_val_results = []
-    all_selections  = []
-    final_model     = None
+    pipeline = PipelineProgress(total_folds=n_folds, model_type=model_type)
+    all_selections = []
+    final_model    = None
     final_threshold = 0.3
 
-    for i in tqdm(range(min_train_months, len(all_months)), desc="Walk-forward"):
+    print(f"\n{'─'*60}")
+    print(f"  ▶  Walk-forward training — {n_folds} folds")
+    print(f"{'─'*60}")
+
+    for i in range(min_train_months, len(all_months)):
         train_months = all_months[:i]
         val_month    = all_months[i]
+        fold_idx     = i - min_train_months + 1
 
-        # Pure in-memory slice — O(1)
+        pipeline.start_fold(fold_idx, len(train_months), val_month)
+
+        # O(1) slices
         train_df = full_df[full_df["TARGET_MONTH"].isin(set(train_months))]
         val_df   = full_df[full_df["TARGET_MONTH"] == val_month]
 
         if train_df.empty or train_df["IS_PROFITABLE"].sum() < 5:
+            print(f"       ⚠ Skipped — insufficient positive samples in train")
             continue
         if val_df.empty or val_df["IS_PROFITABLE"].nunique() < 2:
+            print(f"       ⚠ Skipped — val month has only one class")
             continue
 
         X_train = train_df[feat_cols].fillna(0).values.astype(np.float32)
@@ -225,7 +234,6 @@ def run_training(
         if use_smote:
             X_train, y_train = apply_smote(X_train, y_train)
 
-        # Build and train model
         if model_type == "logistic":
             model = build_logistic_regression()
         elif model_type == "lightgbm":
@@ -236,20 +244,13 @@ def run_training(
             raise ValueError(f"Unknown model: {model_type}")
 
         model.fit(X_train, y_train)
-
-        # Tune decision threshold on validation set
         threshold = tune_threshold(model, X_val, y_val, metric="f1")
-
-        # Evaluate
-        metrics = evaluate_model(
-            model, X_val, y_val,
-            threshold=threshold, label=val_month
+        metrics   = evaluate_model(
+            model, X_val, y_val, threshold=threshold, label=val_month
         )
-        all_val_results.append({
-            **metrics, "MONTH": val_month, "n_train": len(y_train)
-        })
 
-        # Select opportunities for this month
+        pipeline.end_fold(metrics)
+
         val_features = val_df[feat_cols + ["EID", "PEAKID"]].copy()
         selections   = select_from_model(
             model, val_features, val_month, threshold, feat_cols, target_k
@@ -260,26 +261,10 @@ def run_training(
         final_threshold = threshold
 
     # ------------------------------------------------------------------
-    # Print summary
+    # Final summary
     # ------------------------------------------------------------------
-    if not all_val_results:
-        print("[ERROR] No validation results.")
-        return final_model, final_threshold, pd.DataFrame()
+    pipeline.print_final_summary()
 
-    results_df = pd.DataFrame(all_val_results)
-    print("\n" + "=" * 70)
-    print(f"WALK-FORWARD RESULTS — {model_type.upper()}")
-    print("=" * 70)
-    cols = ["MONTH", "n_train", "f1", "precision", "recall", "pr_auc"]
-    print(results_df[[c for c in cols if c in results_df]].to_string(index=False))
-    print("-" * 70)
-    print(f"Mean F1:        {results_df['f1'].mean():.4f}")
-    print(f"Mean Precision: {results_df['precision'].mean():.4f}")
-    print(f"Mean Recall:    {results_df['recall'].mean():.4f}")
-    print(f"Mean PR-AUC:    {results_df['pr_auc'].mean():.4f}")
-    print("=" * 70)
-
-    # Save model
     if save_model and final_model is not None:
         model_path = Path(f"model_{model_type}.pkl")
         with open(model_path, "wb") as f:
@@ -289,7 +274,7 @@ def run_training(
                 "feat_cols":  feat_cols,
                 "model_type": model_type,
             }, f)
-        print(f"\n[INFO] Model saved → {model_path}")
+        print(f"\n  Model saved → {model_path}")
 
     selections_df = (
         pd.concat(all_selections, ignore_index=True)
