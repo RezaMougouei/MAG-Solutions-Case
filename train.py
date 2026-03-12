@@ -100,9 +100,12 @@ def build_full_dataset_by_year(
             decision_month = prev_month(target_month)
             cutoff_dt      = pd.Timestamp(f"{decision_month}-08 00:00:00")
 
-            sm_allowed   = sim_monthly_df[sim_monthly_df["MONTH"] <= target_month]
-            sd_allowed   = sim_daily_df[sim_daily_df["DATETIME"] <= cutoff_dt] \
-                           if not sim_daily_df.empty else pd.DataFrame()
+            sm_allowed = sim_monthly_df[
+                sim_monthly_df["MONTH"].astype(str) <= target_month
+            ]
+            sd_allowed = sim_daily_df[
+                sim_daily_df["DATETIME"] <= cutoff_dt
+            ] if not sim_daily_df.empty else pd.DataFrame()
             hist_allowed = hist_profit_df[hist_profit_df["MONTH"] <= decision_month]
 
             fm = build_feature_matrix(
