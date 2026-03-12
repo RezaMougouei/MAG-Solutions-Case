@@ -19,7 +19,7 @@ import pandas as pd
 # Helpers
 # ---------------------------------------------------------------------------
 
-DATA_ROOT        = Path(__file__).parent / "data"
+DATA_ROOT  = Path("/workspace/data")
 COSTS_FILE       = DATA_ROOT / "costs.parquet"
 PRICES_FILE      = DATA_ROOT / "prices.parquet"
 
