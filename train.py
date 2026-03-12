@@ -1,30 +1,28 @@
 """
 train.py
 --------
-Training pipeline for FTR opportunity classification.
+Optimized training pipeline — O(n) instead of O(n²).
 
-Strategy: Walk-Forward Cross-Validation (Time Series Split)
-------------------------------------------------------------
-We NEVER use future data to train. For each fold:
-  - Train on months [start ... M-1]
-  - Validate on month M
-  - Predict on month M+1
+Key fix: build the full labeled feature matrix ONCE across all months,
+then slice train/val windows from it in memory. No redundant recomputation.
 
-This mirrors real trading conditions exactly and enforces anti-leakage
-at the training level, not just the feature level.
-
-Walk-forward prevents the classic mistake of training on 2020-2023
-and testing on 2020 — which would leak future knowledge into training.
+Walk-Forward Cross-Validation (Time Series Split)
+--------------------------------------------------
+For each fold i:
+  - Train on rows where MONTH in all_months[:i]
+  - Validate on rows where MONTH == all_months[i]
+  - Anti-leakage enforced at feature level inside build_feature_matrix.
 
 Usage:
-    python train.py --start-month 2020-01 --end-month 2023-12
     python train.py --start-month 2020-01 --end-month 2023-12 --model lightgbm
+    python train.py --start-month 2020-01 --end-month 2023-12 --model logistic
     python train.py --start-month 2020-01 --end-month 2023-12 --model xgboost --smote
 """
 
 import argparse
 import gc
 import pickle
+import time
 from pathlib import Path
 
 import numpy as np
@@ -37,7 +35,7 @@ from feature_builder import build_feature_matrix
 from models import (
     build_logistic_regression, build_lightgbm, build_xgboost,
     get_available_features, compute_pos_weight,
-    apply_smote, tune_threshold, evaluate_model
+    apply_smote, tune_threshold, evaluate_model,
 )
 from main import month_range, prev_month, years_needed
 
@@ -46,29 +44,29 @@ MAX_K = 100
 
 
 # ---------------------------------------------------------------------------
-# Walk-forward training loop
+# Build full dataset ONCE — O(n)
 # ---------------------------------------------------------------------------
 
-def build_training_dataset(
-    months: list[str],
+def build_full_dataset(
+    all_months: list[str],
     sim_monthly_df: pd.DataFrame,
     sim_daily_df: pd.DataFrame,
     hist_profit_df: pd.DataFrame,
     lookback_months: int = 6,
 ) -> pd.DataFrame:
     """
-    Build a labeled feature matrix across multiple months.
-    Each row = one (EID, MONTH, PEAKID) opportunity with IS_PROFITABLE label.
+    Build labeled feature matrix for ALL months in a single pass.
+    Each row = one (EID, TARGET_MONTH, PEAKID) with IS_PROFITABLE label.
 
-    Anti-leakage: for each target_month, only data up to decision_month is used.
+    Anti-leakage is enforced inside build_feature_matrix per month —
+    each month only sees data available at its decision time.
     """
     frames = []
 
-    for target_month in tqdm(months, desc="  Building dataset", leave=False):
+    for target_month in tqdm(all_months, desc="Building dataset"):
         decision_month = prev_month(target_month)
         cutoff_dt      = pd.Timestamp(f"{decision_month}-08 00:00:00")
 
-        # Anti-leakage filtering
         sm_allowed   = sim_monthly_df[sim_monthly_df["MONTH"] <= target_month]
         sd_allowed   = sim_daily_df[sim_daily_df["DATETIME"] <= cutoff_dt]
         hist_allowed = hist_profit_df[hist_profit_df["MONTH"] <= decision_month]
@@ -82,70 +80,62 @@ def build_training_dataset(
         if fm.empty:
             continue
 
-        # Attach ground truth labels for this target_month
+        # Attach ground truth
         truth = hist_profit_df[
             hist_profit_df["MONTH"] == target_month
         ][["EID", "PEAKID", "IS_PROFITABLE", "PROFIT"]].copy()
 
-        # EID may be categorical — normalize to string for merge
         fm["EID"]    = fm["EID"].astype(str)
         truth["EID"] = truth["EID"].astype(str)
 
         fm = fm.merge(truth, on=["EID", "PEAKID"], how="left")
         fm["IS_PROFITABLE"] = fm["IS_PROFITABLE"].fillna(False).astype(int)
         fm["PROFIT"]        = fm["PROFIT"].fillna(0.0)
-
+        fm["TARGET_MONTH"]  = target_month
         frames.append(fm)
 
     if not frames:
         return pd.DataFrame()
 
-    return pd.concat(frames, ignore_index=True)
+    full_df = pd.concat(frames, ignore_index=True)
+    pos_rate = full_df["IS_PROFITABLE"].mean() * 100
+    print(f"\n[INFO] Full dataset: {full_df.shape[0]:,} rows | "
+          f"{pos_rate:.2f}% profitable | "
+          f"{full_df['TARGET_MONTH'].nunique()} months")
+    return full_df
 
+
+# ---------------------------------------------------------------------------
+# Selection
+# ---------------------------------------------------------------------------
 
 def select_from_model(
     model,
     feature_matrix: pd.DataFrame,
     target_month: str,
     threshold: float,
+    feat_cols: list[str],
     target_k: int = 50,
 ) -> pd.DataFrame:
-    """
-    Use trained model to select opportunities for target_month.
-    Enforces 10-100 constraint:
-      - Take all above threshold, capped at MAX_K
-      - If below MIN_K, take top-MIN_K by probability regardless of threshold
-    """
-    feat_cols = get_available_features(feature_matrix)
-    X = feature_matrix[feat_cols].fillna(0).values.astype(np.float32)
-
+    """Select 10-100 opportunities ranked by predicted probability."""
+    X     = feature_matrix[feat_cols].fillna(0).values.astype(np.float32)
     proba = model.predict_proba(X)[:, 1]
-    feature_matrix = feature_matrix.copy()
-    feature_matrix["_proba"] = proba
 
-    # Sort by probability descending
-    feature_matrix = feature_matrix.sort_values("_proba", ascending=False)
+    fm = feature_matrix.copy()
+    fm["_proba"] = proba
+    fm = fm.sort_values("_proba", ascending=False)
 
-    # Apply threshold
-    above = feature_matrix[feature_matrix["_proba"] >= threshold]
+    above    = fm[fm["_proba"] >= threshold]
+    selected = above.head(MAX_K) if len(above) >= MIN_K else fm.head(MIN_K)
 
-    # Enforce bounds
-    if len(above) >= MIN_K:
-        selected = above.head(MAX_K)
-    else:
-        # Not enough above threshold — take top MIN_K regardless
-        selected = feature_matrix.head(MIN_K)
-
-    # Format output
     selected = selected.copy()
     selected["TARGET_MONTH"] = target_month
     selected["PEAK_TYPE"]    = selected["PEAKID"].map({0: "OFF", 1: "ON"})
-
     return selected[["TARGET_MONTH", "PEAK_TYPE", "EID"]].drop_duplicates()
 
 
 # ---------------------------------------------------------------------------
-# Main training function
+# Walk-forward — O(n) slicing from pre-built dataset
 # ---------------------------------------------------------------------------
 
 def run_training(
@@ -157,14 +147,10 @@ def run_training(
     min_train_months: int = 6,
     lookback_months: int = 6,
     save_model: bool = True,
-) -> tuple[object, float, pd.DataFrame]:
-    """
-    Walk-forward training + evaluation.
+) -> tuple:
 
-    Returns: (trained_model, best_threshold, selections_df)
-    """
-    all_months      = month_range(start_month, end_month)
-    all_years       = years_needed(all_months + [prev_month(m) for m in all_months])
+    all_months = month_range(start_month, end_month)
+    all_years  = years_needed(all_months + [prev_month(m) for m in all_months])
 
     # ------------------------------------------------------------------
     # Load data once
@@ -185,39 +171,61 @@ def run_training(
     sim_daily_df = load_sim_daily(years=all_years)
 
     # ------------------------------------------------------------------
-    # Walk-forward loop
+    # Build full dataset ONCE
     # ------------------------------------------------------------------
-    print(f"\n[INFO] Starting walk-forward training ({model_type})")
-    print(f"       {start_month} → {end_month} | min_train_months={min_train_months}\n")
+    t0      = time.perf_counter()
+    full_df = build_full_dataset(
+        all_months, sim_monthly_df, sim_daily_df,
+        hist_profit_df, lookback_months
+    )
+    print(f"[INFO] Dataset built in {time.perf_counter()-t0:.1f}s")
+
+    # Free sim data — not needed anymore
+    del sim_monthly_df, sim_daily_df
+    gc.collect()
+
+    if full_df.empty:
+        print("[ERROR] Empty dataset.")
+        return None, 0.3, pd.DataFrame()
+
+    feat_cols = get_available_features(full_df)
+    print(f"[INFO] {len(feat_cols)} features: {feat_cols}\n")
+
+    # ------------------------------------------------------------------
+    # Walk-forward loop — just array slicing, no recomputation
+    # ------------------------------------------------------------------
+    n_folds = len(all_months) - min_train_months
+    print(f"[INFO] Walk-forward ({model_type}) | {n_folds} folds\n")
 
     all_val_results = []
     all_selections  = []
     final_model     = None
-    final_threshold = 0.3   # default, will be tuned
+    final_threshold = 0.3
 
-    for i in tqdm(range(min_train_months, len(all_months)), desc="Walk-forward folds"):
+    for i in tqdm(range(min_train_months, len(all_months)), desc="Walk-forward"):
         train_months = all_months[:i]
         val_month    = all_months[i]
 
-        # ---- Build training set ------------------------------------------
-        train_df = build_training_dataset(
-            train_months, sim_monthly_df, sim_daily_df,
-            hist_profit_df, lookback_months
-        )
+        # Pure in-memory slice — O(1)
+        train_df = full_df[full_df["TARGET_MONTH"].isin(set(train_months))]
+        val_df   = full_df[full_df["TARGET_MONTH"] == val_month]
+
         if train_df.empty or train_df["IS_PROFITABLE"].sum() < 5:
             continue
+        if val_df.empty or val_df["IS_PROFITABLE"].nunique() < 2:
+            continue
 
-        feat_cols = get_available_features(train_df)
-        X_train   = train_df[feat_cols].fillna(0).values.astype(np.float32)
-        y_train   = train_df["IS_PROFITABLE"].values.astype(int)
+        X_train = train_df[feat_cols].fillna(0).values.astype(np.float32)
+        y_train = train_df["IS_PROFITABLE"].values.astype(int)
+        X_val   = val_df[feat_cols].fillna(0).values.astype(np.float32)
+        y_val   = val_df["IS_PROFITABLE"].values.astype(int)
 
-        # ---- Handle imbalance -------------------------------------------
         pos_w = compute_pos_weight(pd.Series(y_train))
 
         if use_smote:
             X_train, y_train = apply_smote(X_train, y_train)
 
-        # ---- Build and train model --------------------------------------
+        # Build and train model
         if model_type == "logistic":
             model = build_logistic_regression()
         elif model_type == "lightgbm":
@@ -225,77 +233,68 @@ def run_training(
         elif model_type == "xgboost":
             model = build_xgboost(pos_weight=pos_w)
         else:
-            raise ValueError(f"Unknown model_type: {model_type}")
+            raise ValueError(f"Unknown model: {model_type}")
 
         model.fit(X_train, y_train)
 
-        # ---- Build validation set (val_month) ---------------------------
-        val_df = build_training_dataset(
-            [val_month], sim_monthly_df, sim_daily_df,
-            hist_profit_df, lookback_months
-        )
-        if val_df.empty:
-            continue
-
-        X_val = val_df[feat_cols].fillna(0).values.astype(np.float32)
-        y_val = val_df["IS_PROFITABLE"].values.astype(int)
-
-        if len(np.unique(y_val)) < 2:
-            continue
-
-        # ---- Tune threshold on validation set ---------------------------
+        # Tune decision threshold on validation set
         threshold = tune_threshold(model, X_val, y_val, metric="f1")
 
-        # ---- Evaluate ---------------------------------------------------
-        metrics = evaluate_model(model, X_val, y_val,
-                                 threshold=threshold, label=val_month)
-        all_val_results.append({**metrics, "MONTH": val_month,
-                                 "n_train": len(y_train)})
+        # Evaluate
+        metrics = evaluate_model(
+            model, X_val, y_val,
+            threshold=threshold, label=val_month
+        )
+        all_val_results.append({
+            **metrics, "MONTH": val_month, "n_train": len(y_train)
+        })
 
-        # ---- Select opportunities for val_month -------------------------
-        val_fm = val_df[feat_cols + ["EID", "PEAKID"]].copy()
-        selections = select_from_model(model, val_fm, val_month, threshold, target_k)
+        # Select opportunities for this month
+        val_features = val_df[feat_cols + ["EID", "PEAKID"]].copy()
+        selections   = select_from_model(
+            model, val_features, val_month, threshold, feat_cols, target_k
+        )
         all_selections.append(selections)
 
-        # Keep the most recently trained model as final
         final_model     = model
         final_threshold = threshold
 
     # ------------------------------------------------------------------
-    # Summary
+    # Print summary
     # ------------------------------------------------------------------
     if not all_val_results:
-        print("[ERROR] No validation results produced.")
+        print("[ERROR] No validation results.")
         return final_model, final_threshold, pd.DataFrame()
 
     results_df = pd.DataFrame(all_val_results)
     print("\n" + "=" * 70)
     print(f"WALK-FORWARD RESULTS — {model_type.upper()}")
     print("=" * 70)
-    print(results_df[["MONTH", "n_train", "f1", "precision",
-                       "recall", "pr_auc"]].to_string(index=False))
+    cols = ["MONTH", "n_train", "f1", "precision", "recall", "pr_auc"]
+    print(results_df[[c for c in cols if c in results_df]].to_string(index=False))
     print("-" * 70)
-    print(f"Mean F1:       {results_df['f1'].mean():.4f}")
-    print(f"Mean Precision:{results_df['precision'].mean():.4f}")
-    print(f"Mean Recall:   {results_df['recall'].mean():.4f}")
-    print(f"Mean PR-AUC:   {results_df['pr_auc'].mean():.4f}")
+    print(f"Mean F1:        {results_df['f1'].mean():.4f}")
+    print(f"Mean Precision: {results_df['precision'].mean():.4f}")
+    print(f"Mean Recall:    {results_df['recall'].mean():.4f}")
+    print(f"Mean PR-AUC:    {results_df['pr_auc'].mean():.4f}")
     print("=" * 70)
 
-    # ------------------------------------------------------------------
     # Save model
-    # ------------------------------------------------------------------
     if save_model and final_model is not None:
         model_path = Path(f"model_{model_type}.pkl")
         with open(model_path, "wb") as f:
             pickle.dump({
-                "model":     final_model,
-                "threshold": final_threshold,
-                "feat_cols": feat_cols,
+                "model":      final_model,
+                "threshold":  final_threshold,
+                "feat_cols":  feat_cols,
                 "model_type": model_type,
             }, f)
         print(f"\n[INFO] Model saved → {model_path}")
 
-    selections_df = pd.concat(all_selections, ignore_index=True) if all_selections else pd.DataFrame()
+    selections_df = (
+        pd.concat(all_selections, ignore_index=True)
+        if all_selections else pd.DataFrame()
+    )
     return final_model, final_threshold, selections_df
 
 
@@ -304,16 +303,15 @@ def run_training(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train FTR opportunity classifier")
-    parser.add_argument("--start-month",       required=True)
-    parser.add_argument("--end-month",         required=True)
-    parser.add_argument("--model",             default="lightgbm",
+    parser = argparse.ArgumentParser(description="Train FTR classifier")
+    parser.add_argument("--start-month",      required=True)
+    parser.add_argument("--end-month",        required=True)
+    parser.add_argument("--model",            default="lightgbm",
                         choices=["logistic", "lightgbm", "xgboost"])
-    parser.add_argument("--smote",             action="store_true",
-                        help="Apply SMOTE oversampling (requires imbalanced-learn)")
-    parser.add_argument("--target-k",          type=int, default=50)
-    parser.add_argument("--min-train-months",  type=int, default=6)
-    parser.add_argument("--output",            default="opportunities.csv")
+    parser.add_argument("--smote",            action="store_true")
+    parser.add_argument("--target-k",         type=int, default=50)
+    parser.add_argument("--min-train-months", type=int, default=6)
+    parser.add_argument("--output",           default="opportunities.csv")
     args = parser.parse_args()
 
     model, threshold, selections = run_training(
@@ -325,7 +323,7 @@ if __name__ == "__main__":
         min_train_months=args.min_train_months,
     )
 
-    if not selections.empty:
+    if selections is not None and not selections.empty:
         out = Path(args.output)
         selections.to_csv(out, index=False)
         print(f"\n[DONE] {len(selections)} opportunities → {out}")
