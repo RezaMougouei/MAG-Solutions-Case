@@ -1,18 +1,12 @@
 """
 train.py
 --------
-Memory-efficient training pipeline.
+Memory-efficient training pipeline implementing all 5 fixes.
 
-Core strategy: process ONE YEAR of sim data at a time.
-- Load sim_monthly for year Y (~2-3 GB)
-- Build features for all months in year Y
-- Discard sim data before loading next year
-
-Walk-forward loop memory fixes:
-- gc.collect() between every fold
-- train_df deleted immediately after converting to numpy
-- X_train/y_train deleted immediately after model.fit()
-- < comparison instead of isin() to avoid large set copies
+Fix 4: Instead of accumulating all yearly DataFrames in memory and
+concatenating at the end, each year's feature matrix is written to a
+temporary Parquet file on disk. The final dataset is assembled by
+reading these small temp files — peak memory = one year at a time.
 
 Usage:
     python train.py --start-month 2020-02 --end-month 2023-12 --model lightgbm
@@ -23,6 +17,7 @@ Usage:
 import argparse
 import gc
 import pickle
+import tempfile
 import time
 from pathlib import Path
 
@@ -32,6 +27,7 @@ import pandas as pd
 from data_loader import (
     load_costs, load_prices,
     load_sim_monthly_year, load_sim_daily_year,
+    month_str_to_int,
 )
 from profitability import compute_profitability
 from feature_builder import build_feature_matrix
@@ -48,26 +44,34 @@ MAX_K = 100
 
 
 # ---------------------------------------------------------------------------
-# Build dataset YEAR BY YEAR
+# Fix 4: Build dataset year by year, write to temp Parquet files
 # ---------------------------------------------------------------------------
 
 def build_full_dataset_by_year(
     all_months: list[str],
     hist_profit_df: pd.DataFrame,
     lookback_months: int = 6,
-) -> pd.DataFrame:
+    temp_dir: Path = None,
+) -> Path:
     """
-    Build full labeled feature matrix one year at a time.
-    Peak memory = one year of sim data (~3 GB) not all years (~10 GB).
+    Build labeled feature matrix one year at a time.
+    Each year's result is written to a temp Parquet file immediately,
+    then the DataFrame is freed. Returns path to combined Parquet file.
+
+    Peak memory = one year of sim data + one year of features (not all years).
     """
+    if temp_dir is None:
+        temp_dir = Path(tempfile.mkdtemp())
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
     year_to_months: dict[int, list[str]] = {}
     for tm in all_months:
         year = int(prev_month(tm)[:4])
         year_to_months.setdefault(year, []).append(tm)
 
-    all_years    = sorted(year_to_months.keys())
-    progress     = DatasetBuildProgress(total_months=len(all_months))
-    all_frames   = []
+    all_years  = sorted(year_to_months.keys())
+    progress   = DatasetBuildProgress(total_months=len(all_months))
+    temp_files = []
 
     for year in all_years:
         months_this_year = year_to_months[year]
@@ -86,23 +90,22 @@ def build_full_dataset_by_year(
             gc.collect()
             continue
 
-        # Ensure MONTH is plain string for comparison
-        sim_monthly_df["MONTH"] = sim_monthly_df["MONTH"].astype(str)
-        if not sim_daily_df.empty:
-            sim_daily_df["MONTH"] = sim_daily_df["MONTH"].astype(str)
+        year_frames = []
 
         for target_month in months_this_year:
-            decision_month = prev_month(target_month)
-            cutoff_dt      = pd.Timestamp(f"{decision_month}-08 00:00:00")
+            decision_month    = prev_month(target_month)
+            decision_month_int = month_str_to_int(decision_month)
+            target_month_int   = month_str_to_int(target_month)
+            cutoff_dt          = pd.Timestamp(f"{decision_month}-08 00:00:00")
 
-            sm_allowed   = sim_monthly_df[
-                sim_monthly_df["MONTH"].astype(str) <= target_month
+            sm_allowed = sim_monthly_df[
+                sim_monthly_df["MONTH"] <= target_month_int
             ]
-            sd_allowed   = sim_daily_df[
+            sd_allowed = sim_daily_df[
                 sim_daily_df["DATETIME"] <= cutoff_dt
             ] if not sim_daily_df.empty else pd.DataFrame()
             hist_allowed = hist_profit_df[
-                hist_profit_df["MONTH"] <= decision_month
+                hist_profit_df["MONTH"] <= decision_month_int
             ]
 
             fm = build_feature_matrix(
@@ -116,42 +119,69 @@ def build_full_dataset_by_year(
                 progress.update(target_month, 0, 0)
                 continue
 
+            # Attach ground truth labels
             truth = hist_profit_df[
-                hist_profit_df["MONTH"] == target_month
+                hist_profit_df["MONTH"] == target_month_int
             ][["EID", "PEAKID", "IS_PROFITABLE", "PROFIT"]].copy()
 
             fm["EID"]    = fm["EID"].astype(str)
             truth["EID"] = truth["EID"].astype(str)
 
             fm = fm.merge(truth, on=["EID", "PEAKID"], how="left")
-            fm["IS_PROFITABLE"] = fm["IS_PROFITABLE"].fillna(False).astype(int)
-            fm["PROFIT"]        = fm["PROFIT"].fillna(0.0)
+            fm["IS_PROFITABLE"] = fm["IS_PROFITABLE"].fillna(False).astype("int8")
+            fm["PROFIT"]        = fm["PROFIT"].fillna(0.0).astype("float32")
             fm["TARGET_MONTH"]  = target_month
 
+            del truth, sm_allowed, sd_allowed, hist_allowed
             progress.update(target_month, len(fm), int(fm["IS_PROFITABLE"].sum()))
-            all_frames.append(fm)
+            year_frames.append(fm)
+            del fm
 
-        # Free sim data before next year
+        # Fix 4: write this year to disk immediately, free memory
+        if year_frames:
+            year_df   = pd.concat(year_frames, ignore_index=True)
+            del year_frames
+            gc.collect()
+
+            temp_path = temp_dir / f"features_{year}.parquet"
+            year_df.to_parquet(temp_path, index=False)
+            temp_files.append(temp_path)
+            print(f"  Written {len(year_df):,} rows → {temp_path.name}")
+            del year_df
+            gc.collect()
+
         del sim_monthly_df, sim_daily_df
         gc.collect()
         print(f"  Sim data freed | mem={get_memory_mb():.0f} MB")
 
-    if not all_frames:
-        return pd.DataFrame()
+    if not temp_files:
+        return None
 
-    print(f"\n  Concatenating {len(all_frames)} frames...", end=" ", flush=True)
-    t0      = time.perf_counter()
-    full_df = pd.concat(all_frames, ignore_index=True)
-    del all_frames
+    # Combine temp files into one final Parquet
+    print(f"\n  Merging {len(temp_files)} temp files...", end=" ", flush=True)
+    t0     = time.perf_counter()
+    frames = [pd.read_parquet(f) for f in temp_files]
+    full_df = pd.concat(frames, ignore_index=True)
+    del frames
     gc.collect()
-    print(f"{time.perf_counter()-t0:.1f}s")
+
+    final_path = temp_dir / "full_dataset.parquet"
+    full_df.to_parquet(final_path, index=False)
+    print(f"{time.perf_counter()-t0:.1f}s | {len(full_df):,} rows")
+
+    # Clean up yearly temp files
+    for f in temp_files:
+        f.unlink()
 
     pos_rate = full_df["IS_PROFITABLE"].mean() * 100
     print(f"  Dataset: {full_df.shape[0]:,} rows | "
           f"{pos_rate:.2f}% profitable | "
           f"{full_df['TARGET_MONTH'].nunique()} months | "
           f"mem={get_memory_mb():.0f} MB")
-    return full_df
+
+    del full_df
+    gc.collect()
+    return final_path
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +202,7 @@ def select_from_model(
 
     fm = feature_matrix.copy()
     fm["_proba"] = proba
-    fm = fm.sort_values("_proba", ascending=False)
+    fm.sort_values("_proba", ascending=False, inplace=True)
 
     above    = fm[fm["_proba"] >= threshold]
     selected = above.head(MAX_K) if len(above) >= MIN_K else fm.head(MIN_K)
@@ -210,7 +240,7 @@ def run_training(
     print(f"{'='*60}")
 
     # ------------------------------------------------------------------
-    # Stage 1: Costs + prices
+    # Stage 1: Costs + prices — delete costs_df after profitability (Fix 5)
     # ------------------------------------------------------------------
     with StageTimer("Loading costs & prices"):
         costs_df  = load_costs()
@@ -218,26 +248,41 @@ def run_training(
 
     with StageTimer("Computing historical profitability"):
         hist_profit_df = compute_profitability(prices_df, costs_df)
-        del prices_df
+        # Fix 5: delete both immediately
+        del prices_df, costs_df
         gc.collect()
 
     # ------------------------------------------------------------------
-    # Stage 2: Build dataset year by year
+    # Stage 2: Build dataset — disk-backed, one year at a time (Fix 4)
     # ------------------------------------------------------------------
+    temp_dir = Path(tempfile.mkdtemp(prefix="mag_features_"))
+    print(f"\n  Temp dir: {temp_dir}")
+
     with StageTimer(f"Building feature dataset ({len(all_months)} months)"):
-        full_df = build_full_dataset_by_year(
-            all_months, hist_profit_df, lookback_months
+        dataset_path = build_full_dataset_by_year(
+            all_months, hist_profit_df, lookback_months, temp_dir
         )
 
-    if full_df.empty:
+    # Free hist_profit_df — no longer needed after dataset is built
+    del hist_profit_df
+    gc.collect()
+
+    if dataset_path is None:
         print("[ERROR] Empty dataset.")
         return None, 0.3, pd.DataFrame()
 
+    # Load final dataset from disk
+    print(f"\n  Loading final dataset from {dataset_path.name}...",
+          end=" ", flush=True)
+    t0      = time.perf_counter()
+    full_df = pd.read_parquet(dataset_path)
+    print(f"{time.perf_counter()-t0:.1f}s | mem={get_memory_mb():.0f} MB")
+
     feat_cols = get_available_features(full_df)
-    print(f"\n  Features ({len(feat_cols)}): {feat_cols}")
+    print(f"  Features ({len(feat_cols)}): {feat_cols}")
 
     # ------------------------------------------------------------------
-    # Stage 3: Walk-forward — O(1) slicing, aggressive memory cleanup
+    # Stage 3: Walk-forward — O(1) slicing, aggressive cleanup per fold
     # ------------------------------------------------------------------
     pipeline        = PipelineProgress(total_folds=n_folds, model_type=model_type)
     all_selections  = []
@@ -252,12 +297,10 @@ def run_training(
         val_month = all_months[i]
         fold_idx  = i - min_train_months + 1
 
-        # Free previous fold memory before starting
         gc.collect()
-
         pipeline.start_fold(fold_idx, i, val_month)
 
-        # < comparison: faster than isin(), no large set allocation
+        # < comparison avoids large set allocation
         train_df = full_df[full_df["TARGET_MONTH"] < val_month]
         val_df   = full_df[full_df["TARGET_MONTH"] == val_month]
 
@@ -270,7 +313,7 @@ def run_training(
             del train_df, val_df
             continue
 
-        # Convert to numpy then immediately free dataframes
+        # Convert to numpy then free dataframes immediately
         X_train = train_df[feat_cols].fillna(0).values.astype(np.float32)
         y_train = train_df["IS_PROFITABLE"].values.astype(int)
         X_val   = val_df[feat_cols].fillna(0).values.astype(np.float32)
@@ -281,7 +324,6 @@ def run_training(
         gc.collect()
 
         pos_w = compute_pos_weight(pd.Series(y_train))
-
         if use_smote:
             X_train, y_train = apply_smote(X_train, y_train)
 
@@ -318,6 +360,13 @@ def run_training(
 
         final_model     = model
         final_threshold = threshold
+
+    # Clean up temp files
+    try:
+        dataset_path.unlink()
+        temp_dir.rmdir()
+    except Exception:
+        pass
 
     pipeline.print_final_summary()
 
