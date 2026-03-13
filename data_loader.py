@@ -20,6 +20,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import pyarrow.dataset as ds
+import pyarrow.compute as pc
 import pyarrow as pa
 
 # ---------------------------------------------------------------------------
@@ -99,32 +100,32 @@ def _read_parquet_with_pushdown(
     filters: Optional[list] = None,
 ) -> pd.DataFrame:
     """
-    Fix 1: Use pyarrow.dataset for predicate pushdown.
-    Only row groups matching `filters` are read from disk.
+    Updated version using the Scanner API to correctly handle filter lists.
     """
-    size = _mb(path)
+    size = _mb(path) # Helper from your data_loader.py
     filter_str = f" | filters={filters}" if filters else ""
     print(f"    {path.name} ({size:.0f} MB){filter_str}...",
           end=" ", flush=True)
     t0 = time.perf_counter()
 
     if filters is not None:
-        # --- FIX: Type Alignment for PyArrow ---
-        # PyArrow is strict: if the column is a timestamp, the filter value must be a timestamp.
+        # 1. Type Alignment: Convert strings to Timestamps
+        # This prevents the ArrowNotImplementedError for timestamp columns.
         processed_filters = []
         for col, op, val in filters:
-            # Check for common date/time column names used in your pipeline
             if col in ["DATETIME", "MONTH"] and isinstance(val, str):
                 val = pd.Timestamp(val)
             processed_filters.append((col, op, val))
         
-        # Predicate pushdown via pyarrow
+        # 2. Use the Scanner API to convert the list into a valid Expression
         dataset = ds.dataset(str(path), format="parquet")
-        # Use the processed_filters here
-        table   = dataset.to_table(columns=columns, filter=processed_filters)
+        scanner = dataset.scanner(columns=columns, filter=processed_filters)
+        table   = scanner.to_table()
+        
         df      = table.to_pandas()
         del table
     else:
+        # Fallback to standard pandas read if no filters are provided
         df = pd.read_parquet(path, columns=columns)
 
     elapsed = time.perf_counter() - t0
