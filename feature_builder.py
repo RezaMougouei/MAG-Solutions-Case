@@ -66,6 +66,16 @@ def _agg_sim(
 
     return mean_features
 
+def diagnostic_feature_test(df, feat_cols):
+    # Check for zero variance
+    variances = df[feat_cols].var()
+    useless_const = variances[variances == 0].index.tolist()
+    
+    # Check for high correlation
+    corr_matrix = df[feat_cols].corr().abs()
+    # Logic to find pairs with > 0.95 correlation
+    
+    return useless_const
 
 def build_sim_monthly_features(
     sim_monthly_df: pd.DataFrame,
