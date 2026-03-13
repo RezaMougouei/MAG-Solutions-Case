@@ -101,7 +101,6 @@ def _read_parquet_with_pushdown(
     """
     Fix 1: Use pyarrow.dataset for predicate pushdown.
     Only row groups matching `filters` are read from disk.
-    Falls back to pd.read_parquet if filters is None.
     """
     size = _mb(path)
     filter_str = f" | filters={filters}" if filters else ""
@@ -110,9 +109,19 @@ def _read_parquet_with_pushdown(
     t0 = time.perf_counter()
 
     if filters is not None:
+        # --- FIX: Type Alignment for PyArrow ---
+        # PyArrow is strict: if the column is a timestamp, the filter value must be a timestamp.
+        processed_filters = []
+        for col, op, val in filters:
+            # Check for common date/time column names used in your pipeline
+            if col in ["DATETIME", "MONTH"] and isinstance(val, str):
+                val = pd.Timestamp(val)
+            processed_filters.append((col, op, val))
+        
         # Predicate pushdown via pyarrow
         dataset = ds.dataset(str(path), format="parquet")
-        table   = dataset.to_table(columns=columns, filter=_build_pa_filter(filters))
+        # Use the processed_filters here
+        table   = dataset.to_table(columns=columns, filter=processed_filters)
         df      = table.to_pandas()
         del table
     else:
