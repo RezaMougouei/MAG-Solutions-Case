@@ -3,6 +3,8 @@ import glob
 
 files = glob.glob('/workspace/data/**/*.parquet', recursive=True)
 
-df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
-
-df.to_csv('/workspace/output.csv', index=False)
+first = True
+for f in files:
+    df = pd.read_parquet(f)
+    df.to_csv('/workspace/output.csv', mode='a', index=False, header=first)
+    first = False
