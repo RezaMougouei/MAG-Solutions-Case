@@ -94,44 +94,21 @@ def _optimize_sim_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# In data_loader.py, replace _read_parquet_with_pushdown with this:
+
 def _read_parquet_with_pushdown(
     path: Path,
     columns: Optional[list[str]] = None,
     filters: Optional[list] = None,
 ) -> pd.DataFrame:
-    """
-    Updated version using the Scanner API to correctly handle filter lists.
-    """
-    size = _mb(path) # Helper from your data_loader.py
-    filter_str = f" | filters={filters}" if filters else ""
-    print(f"    {path.name} ({size:.0f} MB){filter_str}...",
-          end=" ", flush=True)
+    size = _mb(path)
+    print(f"    {path.name} ({size:.0f} MB)...", end=" ", flush=True)
     t0 = time.perf_counter()
-
-    if filters is not None:
-        # 1. Type Alignment: Convert strings to Timestamps
-        # This prevents the ArrowNotImplementedError for timestamp columns.
-        processed_filters = []
-        for col, op, val in filters:
-            if col in ["DATETIME", "MONTH"] and isinstance(val, str):
-                val = pd.Timestamp(val)
-            processed_filters.append((col, op, val))
-        
-        # 2. Use the Scanner API to convert the list into a valid Expression
-        dataset = ds.dataset(str(path), format="parquet")
-        scanner = dataset.scanner(columns=columns, filter=processed_filters)
-        table   = scanner.to_table()
-        
-        df      = table.to_pandas()
-        del table
-    else:
-        # Fallback to standard pandas read if no filters are provided
-        df = pd.read_parquet(path, columns=columns)
-
+    # pd.read_parquet accepts filters as list of tuples natively via pyarrow engine
+    df = pd.read_parquet(path, columns=columns, filters=filters, engine="pyarrow")
     elapsed = time.perf_counter() - t0
     print(f"{len(df):,} rows | {elapsed:.1f}s")
     return df
-
 
 def _build_pa_filter(filters: list):
     """
@@ -198,15 +175,12 @@ def load_prices(columns: Optional[list[str]] = None) -> pd.DataFrame:
 
 
 def load_sim_monthly_year(year: int) -> pd.DataFrame:
-    """
-    Fix 1: load one year file with predicate pushdown on DATETIME year.
-    Fix 3: MONTH stored as int32.
-    Fix 4: categorize EID/SCENARIOID at load time.
-    """
     path = _find_year_file(DATA_ROOT / "sim_monthly", year)
     if path is None:
         print(f"    [WARN] No sim_monthly file for {year}")
         return pd.DataFrame()
+    filters = [("DATETIME", ">=", f"{year}-01-01"), ("DATETIME", "<=", f"{year}-12-31")]
+    df = _read_parquet_with_pushdown(path, columns=SIM_MONTHLY_COLS, filters=filters)
 
     # Predicate pushdown: only rows where DATETIME year == year
     year_start = f"{year}-01-01"
