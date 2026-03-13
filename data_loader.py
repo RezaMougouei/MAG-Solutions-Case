@@ -101,15 +101,38 @@ def _read_parquet_with_pushdown(
     columns: Optional[list[str]] = None,
     filters: Optional[list] = None,
 ) -> pd.DataFrame:
-    size = _mb(path)
-    print(f"    {path.name} ({size:.0f} MB)...", end=" ", flush=True)
+    """
+    Final optimized reader. Resolves type mismatch between strings and timestamps.
+    """
+    size = path.stat().st_size / 1024 / 1024
+    filter_str = f" | filters={filters}" if filters else ""
+    print(f"    {path.name} ({size:.0f} MB){filter_str}...",
+          end=" ", flush=True)
     t0 = time.perf_counter()
-    # pd.read_parquet accepts filters as list of tuples natively via pyarrow engine
-    df = pd.read_parquet(path, columns=columns, filters=filters, engine="pyarrow")
+
+    if filters is not None:
+        # 1. Type Alignment: Convert string dates to pd.Timestamp objects
+        # This prevents the ArrowNotImplementedError
+        processed_filters = []
+        for col, op, val in filters:
+            if col in ["DATETIME", "MONTH"] and isinstance(val, str):
+                val = pd.Timestamp(val) # Matches the timestamp[ns] in Parquet
+            processed_filters.append((col, op, val))
+        
+        # 2. Use Scanner API to correctly apply the filters during the read
+        dataset = ds.dataset(str(path), format="parquet")
+        scanner = dataset.scanner(columns=columns, filter=processed_filters)
+        table   = scanner.to_table()
+        
+        df      = table.to_pandas()
+        del table # Immediate memory cleanup for large files
+    else:
+        df = pd.read_parquet(path, columns=columns)
+
     elapsed = time.perf_counter() - t0
     print(f"{len(df):,} rows | {elapsed:.1f}s")
     return df
-
+   
 def _build_pa_filter(filters: list):
     """
     Convert simple filter list to pyarrow expression.
