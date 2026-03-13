@@ -1,152 +1,107 @@
 """
 feature_builder.py
 ------------------
-Builds the feature matrix used for opportunity scoring / selection.
+Builds feature matrix for each (EID, TARGET_MONTH, PEAKID) candidate.
 
-For each (EID, TARGET_MONTH, PEAKID) candidate at decision time (cutoff = 7th
-of month M, selecting for M+1), we aggregate signals from:
-
-  1. Monthly simulations for M+1  (forward-looking, legally available at cutoff)
-  2. Daily simulations for days 1-7 of M  (available at cutoff)
-  3. Historical profitability features from months prior to M+1
-
-Anti-leakage contract
----------------------
-* sim_monthly_df  must contain ONLY rows where MONTH <= M+1
-                  (caller responsibility — see main.py)
-* sim_daily_df    must contain ONLY rows where DATETIME <= 8th-of-M 00:00:00
-                  (caller responsibility)
-* hist_profit_df  must contain ONLY rows where MONTH <= M  (i.e., not M+1)
+Updated to use int32 MONTH encoding (YYYYMM) throughout.
+Uses inplace=True where possible to avoid intermediate copies (Fix 5).
 """
 
 import pandas as pd
 import numpy as np
+from data_loader import month_str_to_int
 
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 SIM_IMPACT_COLS = [
     "ACTIVATIONLEVEL",
-    "WINDIMPACT",
-    "SOLARIMPACT",
-    "HYDROIMPACT",
-    "NONRENEWBALIMPACT",
-    "EXTERNALIMPACT",
-    "LOADIMPACT",
-    "TRANSMISSIONOUTAGEIMPACT",
+    "WINDIMPACT", "SOLARIMPACT", "HYDROIMPACT",
+    "NONRENEWBALIMPACT", "EXTERNALIMPACT",
+    "LOADIMPACT", "TRANSMISSIONOUTAGEIMPACT",
 ]
+
+
+def _to_month_int(month) -> int:
+    """Accept either 'YYYY-MM' string or int YYYYMM."""
+    if isinstance(month, str):
+        return month_str_to_int(month)
+    return int(month)
 
 
 def _agg_sim(
     sim_df: pd.DataFrame,
-    price_col: str,   # "PSM" or "PSD"
+    price_col: str,
     prefix: str,
 ) -> pd.DataFrame:
-    """
-    Aggregate simulation signals to (EID, MONTH, PEAKID) level.
+    """Aggregate simulation signals to (EID, MONTH, PEAKID) level."""
+    agg_cols  = [c for c in SIM_IMPACT_COLS + [price_col] if c in sim_df.columns]
 
-    For each numeric column we compute mean across scenarios and hours.
-    We also compute scenario disagreement (std of per-scenario means) as a
-    measure of uncertainty — high disagreement → weaker signal.
-    """
-    agg_cols = SIM_IMPACT_COLS + [price_col]
-    available = [c for c in agg_cols if c in sim_df.columns]
-
-    # Mean across hours AND scenarios → one row per (EID, MONTH, PEAKID)
     mean_features = (
         sim_df
-        .groupby(["EID", "MONTH", "PEAKID"])[available]
+        .groupby(["EID", "PEAKID"])[agg_cols]
         .mean()
         .reset_index()
-        .rename(columns={c: f"{prefix}_{c}_mean" for c in available})
+        .rename(columns={c: f"{prefix}_{c}_mean" for c in agg_cols})
     )
 
-    # Scenario-level means first, then std across scenarios
-    if "SCENARIOID" in sim_df.columns:
+    # Scenario disagreement — std across per-scenario means
+    if "SCENARIOID" in sim_df.columns and price_col in sim_df.columns:
         per_scenario = (
             sim_df
-            .groupby(["EID", "MONTH", "PEAKID", "SCENARIOID"])[[price_col]]
+            .groupby(["EID", "PEAKID", "SCENARIOID"])[[price_col]]
             .mean()
             .reset_index()
         )
         scenario_std = (
             per_scenario
-            .groupby(["EID", "MONTH", "PEAKID"])[[price_col]]
+            .groupby(["EID", "PEAKID"])[[price_col]]
             .std(ddof=0)
             .reset_index()
             .rename(columns={price_col: f"{prefix}_{price_col}_scenario_std"})
         )
+        del per_scenario
         mean_features = mean_features.merge(
-            scenario_std, on=["EID", "MONTH", "PEAKID"], how="left"
+            scenario_std, on=["EID", "PEAKID"], how="left"
         )
+        del scenario_std
 
     return mean_features
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
 def build_sim_monthly_features(
     sim_monthly_df: pd.DataFrame,
-    target_month: str,
+    target_month_int: int,
 ) -> pd.DataFrame:
-    """
-    Extract features from MONTHLY simulations for a specific TARGET_MONTH.
-
-    Returns one row per (EID, PEAKID) with aggregated simulation statistics.
-    """
-    sub = sim_monthly_df[sim_monthly_df["MONTH"] == target_month].copy()
+    sub = sim_monthly_df[sim_monthly_df["MONTH"] == target_month_int].copy()
     if sub.empty:
         return pd.DataFrame(columns=["EID", "PEAKID"])
-
     feats = _agg_sim(sub, price_col="PSM", prefix="sm")
-    feats = feats.drop(columns=["MONTH"])
+    del sub
     return feats
 
 
 def build_sim_daily_features(
     sim_daily_df: pd.DataFrame,
-    decision_month: str,    # month M (not target M+1)
+    decision_month_int: int,
 ) -> pd.DataFrame:
-    """
-    Extract features from DAILY simulations available at cutoff (days 1-7 of M).
-    These are short-term refinements and capture recent grid state.
-
-    Returns one row per (EID, PEAKID) aggregated over the available days.
-    """
-    sub = sim_daily_df[sim_daily_df["MONTH"] == decision_month].copy()
+    sub = sim_daily_df[sim_daily_df["MONTH"] == decision_month_int].copy()
     if sub.empty:
         return pd.DataFrame(columns=["EID", "PEAKID"])
-
     feats = _agg_sim(sub, price_col="PSD", prefix="sd")
-    feats = feats.drop(columns=["MONTH"])
+    del sub
     return feats
 
 
 def build_historical_features(
     hist_profit_df: pd.DataFrame,
-    decision_month: str,    # month M — history is everything strictly before M+1
+    decision_month_int: int,
     lookback_months: int = 6,
 ) -> pd.DataFrame:
-    """
-    Build historical performance features for each (EID, PEAKID).
-
-    Features:
-      - hist_profit_rate_<N>m : fraction of months profitable over last N months
-      - hist_mean_profit_<N>m : average Profit(o) over last N months
-      - hist_mean_pr_<N>m     : average PR over last N months
-      - hist_mean_c_<N>m      : average C over last N months
-
-    decision_month (M) is the cutoff month. We use data up to and including M.
-    """
+    """Historical performance features using int32 MONTH."""
     all_months = sorted(hist_profit_df["MONTH"].unique())
 
-    # Select at most `lookback_months` months ending at decision_month
     cutoff_idx = next(
-        (i for i, m in enumerate(all_months) if m == decision_month), len(all_months) - 1
+        (i for i, m in enumerate(all_months) if m == decision_month_int),
+        len(all_months) - 1
     )
     window = all_months[max(0, cutoff_idx - lookback_months + 1): cutoff_idx + 1]
 
@@ -166,6 +121,8 @@ def build_historical_features(
         )
         .reset_index()
     )
+    del sub
+
     agg.columns = [
         "EID", "PEAKID",
         f"hist_profit_rate_{lookback_months}m",
@@ -174,6 +131,11 @@ def build_historical_features(
         f"hist_mean_c_{lookback_months}m",
         f"hist_months_active_{lookback_months}m",
     ]
+
+    # Fix 5: inplace dtype conversion — no intermediate copy
+    for col in agg.select_dtypes(include="float64").columns:
+        agg[col] = agg[col].astype("float32")
+
     return agg
 
 
@@ -181,31 +143,41 @@ def build_feature_matrix(
     sim_monthly_df: pd.DataFrame,
     sim_daily_df: pd.DataFrame,
     hist_profit_df: pd.DataFrame,
-    target_month: str,   # M+1
-    decision_month: str, # M
+    target_month: str,
+    decision_month: str,
     lookback_months: int = 6,
 ) -> pd.DataFrame:
     """
-    Combine all feature sources into a single feature matrix for scoring.
-
-    Returns: DataFrame indexed by (EID, PEAKID) with all features.
-             NaN values are filled with 0 (consistent with implicit-zero rule).
+    Combine all feature sources into a single matrix.
+    Accepts string months, converts to int32 internally.
     """
-    sm_feats = build_sim_monthly_features(sim_monthly_df, target_month)
-    sd_feats = build_sim_daily_features(sim_daily_df, decision_month)
-    hist_feats = build_historical_features(hist_profit_df, decision_month, lookback_months)
+    target_month_int   = _to_month_int(target_month)
+    decision_month_int = _to_month_int(decision_month)
 
-    # Start from the union of (EID, PEAKID) seen in monthly sims for target month
-    base = sm_feats[["EID", "PEAKID"]].drop_duplicates()
+    sm_feats   = build_sim_monthly_features(sim_monthly_df, target_month_int)
+    sd_feats   = build_sim_daily_features(sim_daily_df, decision_month_int)
+    hist_feats = build_historical_features(
+        hist_profit_df, decision_month_int, lookback_months
+    )
 
-    matrix = base.copy()
-    for feats in [sm_feats, sd_feats, hist_feats]:
+    if sm_feats.empty:
+        return pd.DataFrame()
+
+    # Normalize EID to string for consistent merging
+    sm_feats["EID"] = sm_feats["EID"].astype(str)
+
+    matrix = sm_feats.copy()
+    del sm_feats
+
+    for feats in [sd_feats, hist_feats]:
         if not feats.empty and "EID" in feats.columns:
+            feats["EID"] = feats["EID"].astype(str)
             matrix = matrix.merge(feats, on=["EID", "PEAKID"], how="left")
+        del feats
 
-    # Implicit zero for missing feature values
-    numeric_cols = matrix.select_dtypes(include="number").columns
-    matrix[numeric_cols] = matrix[numeric_cols].fillna(0.0)
+    # Fix 5: fillna inplace on numeric columns only
+    num_cols = matrix.select_dtypes(include="number").columns
+    matrix[num_cols] = matrix[num_cols].fillna(0.0)
 
     matrix["TARGET_MONTH"] = target_month
 
