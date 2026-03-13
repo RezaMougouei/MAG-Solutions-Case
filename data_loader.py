@@ -102,31 +102,61 @@ def _read_parquet_with_pushdown(
     filters: Optional[list] = None,
 ) -> pd.DataFrame:
     """
-    Final optimized reader. Resolves type mismatch between strings and timestamps.
+    High-performance Parquet reader using Predicate Pushdown.
+    
+    This function filters 10GB+ files at the scan level to prevent 
+    MemoryErrors and ensures type-safety between Python strings 
+    and Parquet timestamp[ns] columns.
     """
-    size = path.stat().st_size / 1024 / 1024
-    filter_str = f" | filters={filters}" if filters else ""
-    print(f"    {path.name} ({size:.0f} MB){filter_str}...",
-          end=" ", flush=True)
+    # 1. Calculate file size for progress logging
+    size_mb = path.stat().st_size / 1024 / 1024
+    filter_info = f" | filters={filters}" if filters else ""
+    print(f"    {path.name} ({size_mb:.0f} MB){filter_info}...", end=" ", flush=True)
+    
     t0 = time.perf_counter()
 
     if filters is not None:
-        # 1. Type Alignment: Convert string dates to pd.Timestamp objects
-        # This prevents the ArrowNotImplementedError
+        # 2. Type Alignment: Convert filter strings to pd.Timestamp
+        # This prevents 'ArrowNotImplementedError' during the kernel execution.
         processed_filters = []
         for col, op, val in filters:
             if col in ["DATETIME", "MONTH"] and isinstance(val, str):
-                val = pd.Timestamp(val) # Matches the timestamp[ns] in Parquet
+                val = pd.Timestamp(val)
             processed_filters.append((col, op, val))
-        
-        # 2. Use Scanner API to correctly apply the filters during the read
+
+        # 3. Construct PyArrow Compute Expression
+        # This resolves 'TypeError: Cannot convert list to pyarrow._compute.Expression'
+        pa_expression = None
+        for col, op, val in processed_filters:
+            field = pc.field(col)
+            if op == "==":
+                cond = (field == val)
+            elif op == ">=":
+                cond = (field >= val)
+            elif op == "<=":
+                cond = (field <= val)
+            elif op == ">":
+                cond = (field > val)
+            elif op == "<":
+                cond = (field < val)
+            elif op == "!=":
+                cond = (field != val)
+            else:
+                raise ValueError(f"Unsupported operator: {op}")
+            
+            pa_expression = cond if pa_expression is None else (pa_expression & cond)
+
+        # 4. Execute Scanner with Predicate Pushdown
+        # Only relevant Row Groups are read into memory.
         dataset = ds.dataset(str(path), format="parquet")
-        scanner = dataset.scanner(columns=columns, filter=processed_filters)
-        table   = scanner.to_table()
+        scanner = dataset.scanner(columns=columns, filter=pa_expression)
+        table = scanner.to_table()
         
-        df      = table.to_pandas()
-        del table # Immediate memory cleanup for large files
+        # 5. Final conversion and memory cleanup
+        df = table.to_pandas()
+        del table
     else:
+        # Standard load if no filters are required
         df = pd.read_parquet(path, columns=columns)
 
     elapsed = time.perf_counter() - t0
