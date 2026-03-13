@@ -1,42 +1,34 @@
 """
 profitability.py
 ----------------
-Step 4 from the brief: compute historical profitability for every
-(EID, MONTH, PEAKID) triplet using realized prices and exposure costs.
+Computes Profit(o) = PR_o - C_o for every (EID, MONTH, PEAKID) opportunity.
 
-This module produces the TARGET VARIABLE used to:
-  a) Validate our selections in backtesting.
-  b) Train / calibrate any supervised learning approach.
-
-Key rules enforced here
------------------------
-* Implicit zero: missing prices → 0, missing costs → 0.
-* Profitability condition: PR_o - C_o > 0
-* Anti-leakage: caller must only pass data for months ≤ M (not M+1).
+Updated to work with int32 MONTH encoding (YYYYMM) from the optimized
+data_loader. String MONTH is also accepted for backwards compatibility.
 """
 
 import pandas as pd
+from data_loader import month_str_to_int, month_int_to_str
+
+
+def _ensure_int_month(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize MONTH to int32 regardless of input format."""
+    if "MONTH" in df.columns and df["MONTH"].dtype == object:
+        df = df.copy()
+        df["MONTH"] = df["MONTH"].str.replace("-", "").astype("int32")
+    return df
 
 
 def compute_monthly_pr(prices_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Aggregate hourly realized prices → monthly PR per (EID, MONTH, PEAKID).
-
-    Parameters
-    ----------
-    prices_df : DataFrame with columns [EID, MONTH, PEAKID, PRICEREALIZED]
-                (MONTH already derived as YYYY-MM string)
-
-    Returns
-    -------
-    DataFrame with columns [EID, MONTH, PEAKID, PR]
-    """
+    """Aggregate hourly realized prices → monthly PR per (EID, MONTH, PEAKID)."""
+    prices_df = _ensure_int_month(prices_df)
     pr = (
         prices_df
         .groupby(["EID", "MONTH", "PEAKID"], as_index=False)["PRICEREALIZED"]
         .sum()
         .rename(columns={"PRICEREALIZED": "PR"})
     )
+    pr["PR"] = pr["PR"].astype("float32")
     return pr
 
 
@@ -45,52 +37,35 @@ def compute_profitability(
     costs_df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Compute Profit(o) = PR_o - C_o for every observable opportunity.
+    Compute Profit(o) = PR_o - C_o.
 
-    Parameters
-    ----------
-    prices_df : output of load_prices() — hourly granularity
-    costs_df  : output of load_costs()  — monthly granularity
-
-    Returns
-    -------
-    DataFrame with columns:
-        EID, MONTH, PEAKID, PR, C, PROFIT, IS_PROFITABLE (bool)
-
-    Notes
-    -----
-    * Only opportunities that appear in AT LEAST ONE of the two datasets
-      are included (outer join). All-zero rows (never in either dataset)
-      are excluded — they are trivially PR=0, C=0, Profit=0, not profitable.
-    * This matches the "sparsified / implicit zero" convention.
+    Returns DataFrame with columns:
+        EID, MONTH (int32), PEAKID, PR, C, PROFIT, IS_PROFITABLE
     """
-    # --- Step A: aggregate hourly prices to monthly PR -----------------------
-    pr_df = compute_monthly_pr(prices_df)
+    prices_df = _ensure_int_month(prices_df)
+    costs_df  = _ensure_int_month(costs_df)
 
-    # --- Step B: merge with costs (outer join to capture implicit zeros) ------
+    pr_df = compute_monthly_pr(prices_df)
+    del prices_df
+
     merged = pd.merge(
         pr_df,
         costs_df[["EID", "MONTH", "PEAKID", "C"]],
         on=["EID", "MONTH", "PEAKID"],
         how="outer",
     )
-    merged["PR"] = merged["PR"].fillna(0.0)
-    merged["C"] = merged["C"].fillna(0.0)
+    del pr_df, costs_df
 
-    # --- Step C: compute profit and label ------------------------------------
-    merged["PROFIT"] = merged["PR"] - merged["C"]
+    merged["PR"]            = merged["PR"].fillna(0.0).astype("float32")
+    merged["C"]             = merged["C"].fillna(0.0).astype("float32")
+    merged["PROFIT"]        = (merged["PR"] - merged["C"]).astype("float32")
     merged["IS_PROFITABLE"] = merged["PROFIT"] > 0
+    merged["MONTH"]         = merged["MONTH"].astype("int32")
 
     return merged.reset_index(drop=True)
 
 
 def profitability_summary(profit_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Print and return a high-level summary of historical profitability rates
-    broken down by MONTH and PEAKID.
-
-    Useful for understanding the base rate (~<5% profitable per the case brief).
-    """
     summary = (
         profit_df
         .groupby(["MONTH", "PEAKID"])
@@ -98,9 +73,7 @@ def profitability_summary(profit_df: pd.DataFrame) -> pd.DataFrame:
             total_opportunities=("EID", "count"),
             profitable=("IS_PROFITABLE", "sum"),
         )
-        .assign(
-            profit_rate=lambda x: x["profitable"] / x["total_opportunities"]
-        )
+        .assign(profit_rate=lambda x: x["profitable"] / x["total_opportunities"])
         .reset_index()
     )
     return summary
