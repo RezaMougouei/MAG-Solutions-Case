@@ -1,10 +1,24 @@
-import pandas as pd
+import duckdb
 import glob
+import os
 
-files = glob.glob('/workspace/data/**/*.parquet', recursive=True)
+input_folder = "/workspace/data"
+output_folder = "/workspace/csv"
 
-first = True
+os.makedirs(output_folder, exist_ok=True)
+
+files = glob.glob(f"{input_folder}/**/*.parquet", recursive=True)
+
+con = duckdb.connect()
+
 for f in files:
-    df = pd.read_parquet(f)
-    df.to_csv('/workspace/output.csv', mode='a', index=False, header=first)
-    first = False
+    name = os.path.splitext(os.path.basename(f))[0]
+    out = f"{output_folder}/{name}.csv"
+
+    con.execute(f"""
+        COPY (
+            SELECT * FROM read_parquet('{f}')
+        ) TO '{out}' (HEADER, DELIMITER ',');
+    """)
+
+    print(f"Converted {f} -> {out}")
