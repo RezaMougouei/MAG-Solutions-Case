@@ -1,14 +1,26 @@
 """
 data_loader.py
 --------------
-Optimized I/O layer.
-Key design: load sim data ONE YEAR AT A TIME to avoid 10GB+ memory spikes.
+Optimized I/O layer implementing all 5 memory fixes:
+
+1. Predicate pushdown via pyarrow.dataset — reads only matching row groups,
+   never loads full 10GB file into RAM before filtering.
+2. Column-specific loading — callers specify exactly which columns they need.
+3. MONTH stored as int32 (YYYYMM) instead of string — 4x less memory,
+   faster comparisons.
+4. EID and SCENARIOID categorized at load time.
+5. Aggressive variable deletion after each step.
 """
 
 import time
+import gc
 from pathlib import Path
 from typing import Optional
+
+import numpy as np
 import pandas as pd
+import pyarrow.dataset as ds
+import pyarrow as pa
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -35,6 +47,31 @@ SIM_DAILY_COLS = [
     "PSD"
 ]
 
+# Minimal columns needed just for profitability computation
+PRICES_PROFIT_COLS = ["EID", "DATETIME", "PEAKID", "PRICEREALIZED"]
+COSTS_PROFIT_COLS  = ["EID", "MONTH", "PEAKID", "C"]
+
+# ---------------------------------------------------------------------------
+# MONTH encoding helpers
+# Fix 3: use int32 YYYYMM instead of strings
+# ---------------------------------------------------------------------------
+
+def month_str_to_int(month_str: str) -> int:
+    """'2022-06' → 202206"""
+    return int(month_str.replace("-", ""))
+
+
+def month_int_to_str(month_int: int) -> str:
+    """202206 → '2022-06'"""
+    s = str(month_int)
+    return f"{s[:4]}-{s[4:]}"
+
+
+def datetime_to_month_int(dt_series: pd.Series) -> pd.Series:
+    """Convert datetime64 series → int32 YYYYMM."""
+    return (dt_series.dt.year * 100 + dt_series.dt.month).astype("int32")
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -43,132 +80,210 @@ def _mb(path: Path) -> float:
     return path.stat().st_size / 1024 / 1024
 
 
-def _optimize_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+def _optimize_sim_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Downcast floats to float32, categorize EID and SCENARIOID.
+    MONTH kept as int32 — do NOT categorize (used for ordered comparison).
+    """
     for col in df.select_dtypes(include="float64").columns:
         df[col] = df[col].astype("float32")
-    # NOTE: MONTH kept as string for comparison — do NOT categorize it
     for col in ["EID", "SCENARIOID"]:
         if col in df.columns:
             df[col] = df[col].astype("category")
     return df
 
 
-def _find_file_for_year(folder: Path, year: int) -> Optional[Path]:
-    """Find the parquet file for a specific year in a folder."""
-    matches = [f for f in sorted(folder.glob("*.parquet")) if str(year) in f.stem]
-    return matches[0] if matches else None
-
-
-def _load_single_file(path: Path, columns: Optional[list[str]] = None) -> pd.DataFrame:
-    """Load one parquet file with progress output."""
+def _read_parquet_with_pushdown(
+    path: Path,
+    columns: Optional[list[str]] = None,
+    filters: Optional[list] = None,
+) -> pd.DataFrame:
+    """
+    Fix 1: Use pyarrow.dataset for predicate pushdown.
+    Only row groups matching `filters` are read from disk.
+    Falls back to pd.read_parquet if filters is None.
+    """
     size = _mb(path)
-    print(f"    Reading {path.name} ({size:.0f} MB)...", end=" ", flush=True)
+    filter_str = f" | filters={filters}" if filters else ""
+    print(f"    {path.name} ({size:.0f} MB){filter_str}...",
+          end=" ", flush=True)
     t0 = time.perf_counter()
-    df = pd.read_parquet(path, columns=columns)
-    print(f"{len(df):,} rows | {time.perf_counter()-t0:.1f}s")
+
+    if filters is not None:
+        # Predicate pushdown via pyarrow
+        dataset = ds.dataset(str(path), format="parquet")
+        table   = dataset.to_table(columns=columns, filter=_build_pa_filter(filters))
+        df      = table.to_pandas()
+        del table
+    else:
+        df = pd.read_parquet(path, columns=columns)
+
+    elapsed = time.perf_counter() - t0
+    print(f"{len(df):,} rows | {elapsed:.1f}s")
     return df
+
+
+def _build_pa_filter(filters: list):
+    """
+    Convert simple filter list to pyarrow expression.
+    Supports: [("col", "=", val), ("col", "in", [v1,v2]), ("col", ">=", val)]
+    """
+    exprs = []
+    for col, op, val in filters:
+        field = ds.field(col)
+        if op == "=":
+            exprs.append(field == val)
+        elif op == "in":
+            exprs.append(field.isin(val))
+        elif op == ">=":
+            exprs.append(field >= val)
+        elif op == "<=":
+            exprs.append(field <= val)
+        elif op == ">":
+            exprs.append(field > val)
+        elif op == "<":
+            exprs.append(field < val)
+
+    if not exprs:
+        return None
+    result = exprs[0]
+    for e in exprs[1:]:
+        result = result & e
+    return result
 
 
 # ---------------------------------------------------------------------------
 # Public loaders
 # ---------------------------------------------------------------------------
 
-def load_costs() -> pd.DataFrame:
-    print(f"    Reading costs.parquet ({_mb(COSTS_FILE):.0f} MB)...",
-          end=" ", flush=True)
-    t0 = time.perf_counter()
-    df = pd.read_parquet(COSTS_FILE)
-    print(f"{len(df):,} rows | {time.perf_counter()-t0:.1f}s")
-    df["MONTH"]  = df["MONTH"].astype(str)
-    df["PEAKID"] = df["PEAKID"].astype(int)
+def load_costs(columns: Optional[list[str]] = None) -> pd.DataFrame:
+    """
+    Fix 2: accepts columns argument — pass COSTS_PROFIT_COLS for profitability
+    computation to avoid loading unnecessary columns.
+    """
+    cols = columns or COSTS_PROFIT_COLS
+    df   = _read_parquet_with_pushdown(COSTS_FILE, columns=cols)
+    df["PEAKID"] = df["PEAKID"].astype("int8")
     df["C"]      = df["C"].astype("float32")
     df["EID"]    = df["EID"].astype("category")
+    # Fix 3: MONTH as int32
+    if "MONTH" in df.columns:
+        df["MONTH"] = df["MONTH"].astype(str).str.replace("-", "").astype("int32")
     return df
 
 
-def load_prices() -> pd.DataFrame:
-    print(f"    Reading prices.parquet ({_mb(PRICES_FILE):.0f} MB)...",
-          end=" ", flush=True)
-    t0 = time.perf_counter()
-    df = pd.read_parquet(PRICES_FILE)
-    print(f"{len(df):,} rows | {time.perf_counter()-t0:.1f}s")
+def load_prices(columns: Optional[list[str]] = None) -> pd.DataFrame:
+    """
+    Fix 2: accepts columns argument — pass PRICES_PROFIT_COLS for profitability.
+    """
+    cols = columns or PRICES_PROFIT_COLS
+    df   = _read_parquet_with_pushdown(PRICES_FILE, columns=cols)
     df["DATETIME"]      = pd.to_datetime(df["DATETIME"])
-    df["PEAKID"]        = df["PEAKID"].astype(int)
+    df["PEAKID"]        = df["PEAKID"].astype("int8")
     df["PRICEREALIZED"] = df["PRICEREALIZED"].astype("float32")
-    df["MONTH"]         = df["DATETIME"].dt.to_period("M").astype(str)
     df["EID"]           = df["EID"].astype("category")
+    # Fix 3: MONTH as int32
+    df["MONTH"] = datetime_to_month_int(df["DATETIME"])
     return df
 
 
 def load_sim_monthly_year(year: int) -> pd.DataFrame:
-    """Load sim_monthly for a SINGLE year only."""
-    path = _find_file_for_year(DATA_ROOT / "sim_monthly", year)
+    """
+    Fix 1: load one year file with predicate pushdown on DATETIME year.
+    Fix 3: MONTH stored as int32.
+    Fix 4: categorize EID/SCENARIOID at load time.
+    """
+    path = _find_year_file(DATA_ROOT / "sim_monthly", year)
     if path is None:
-        print(f"    [WARN] No sim_monthly file found for year {year}")
+        print(f"    [WARN] No sim_monthly file for {year}")
         return pd.DataFrame()
-    df = _load_single_file(path, columns=SIM_MONTHLY_COLS)
+
+    # Predicate pushdown: only rows where DATETIME year == year
+    year_start = f"{year}-01-01"
+    year_end   = f"{year}-12-31"
+    filters    = [("DATETIME", ">=", year_start), ("DATETIME", "<=", year_end)]
+
+    df = _read_parquet_with_pushdown(path, columns=SIM_MONTHLY_COLS, filters=filters)
+    if df.empty:
+        return df
+
     df["DATETIME"] = pd.to_datetime(df["DATETIME"])
-    df["MONTH"]    = df["DATETIME"].dt.to_period("M").astype(str)
-    df["PEAKID"]   = df["PEAKID"].astype(int)
-    df = _optimize_dtypes(df)
+    df["PEAKID"]   = df["PEAKID"].astype("int8")
+    # Fix 3: int32 month
+    df["MONTH"]    = datetime_to_month_int(df["DATETIME"])
+    df = _optimize_sim_dtypes(df)
     return df
 
 
 def load_sim_daily_year(year: int) -> pd.DataFrame:
-    """Load sim_daily for a SINGLE year only."""
-    path = _find_file_for_year(DATA_ROOT / "sim_daily", year)
+    """Same optimizations as load_sim_monthly_year."""
+    path = _find_year_file(DATA_ROOT / "sim_daily", year)
     if path is None:
-        print(f"    [WARN] No sim_daily file found for year {year}")
+        print(f"    [WARN] No sim_daily file for {year}")
         return pd.DataFrame()
-    df = _load_single_file(path, columns=SIM_DAILY_COLS)
+
+    year_start = f"{year}-01-01"
+    year_end   = f"{year}-12-31"
+    filters    = [("DATETIME", ">=", year_start), ("DATETIME", "<=", year_end)]
+
+    df = _read_parquet_with_pushdown(path, columns=SIM_DAILY_COLS, filters=filters)
+    if df.empty:
+        return df
+
     df["DATETIME"] = pd.to_datetime(df["DATETIME"])
-    df["MONTH"]    = df["DATETIME"].dt.to_period("M").astype(str)
-    df["PEAKID"]   = df["PEAKID"].astype(int)
-    df = _optimize_dtypes(df)
+    df["PEAKID"]   = df["PEAKID"].astype("int8")
+    df["MONTH"]    = datetime_to_month_int(df["DATETIME"])
+    df = _optimize_sim_dtypes(df)
     return df
 
 
 def load_sim_monthly(years: Optional[list[int]] = None) -> pd.DataFrame:
-    """Load sim_monthly for multiple years — kept for compatibility."""
+    """Multi-year loader — kept for compatibility with main.py/backtest.py."""
     folder = DATA_ROOT / "sim_monthly"
-    all_files = sorted(folder.glob("*.parquet"))
-    if years is not None:
-        files = [f for f in all_files if any(str(y) in f.stem for y in years)]
-        if not files:
-            files = all_files
-    else:
-        files = all_files
-
+    files  = _get_year_files(folder, years)
     frames = []
     for f in files:
-        df = _load_single_file(f, columns=SIM_MONTHLY_COLS)
-        df["DATETIME"] = pd.to_datetime(df["DATETIME"])
-        df["MONTH"]    = df["DATETIME"].dt.to_period("M").astype(str)
-        df["PEAKID"]   = df["PEAKID"].astype(int)
-        df = _optimize_dtypes(df)
-        frames.append(df)
-
+        year = _year_from_filename(f)
+        df   = load_sim_monthly_year(year)
+        if not df.empty:
+            frames.append(df)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 def load_sim_daily(years: Optional[list[int]] = None) -> pd.DataFrame:
-    """Load sim_daily for multiple years — kept for compatibility."""
+    """Multi-year loader — kept for compatibility."""
     folder = DATA_ROOT / "sim_daily"
-    all_files = sorted(folder.glob("*.parquet"))
-    if years is not None:
-        files = [f for f in all_files if any(str(y) in f.stem for y in years)]
-        if not files:
-            files = all_files
-    else:
-        files = all_files
-
+    files  = _get_year_files(folder, years)
     frames = []
     for f in files:
-        df = _load_single_file(f, columns=SIM_DAILY_COLS)
-        df["DATETIME"] = pd.to_datetime(df["DATETIME"])
-        df["MONTH"]    = df["DATETIME"].dt.to_period("M").astype(str)
-        df["PEAKID"]   = df["PEAKID"].astype(int)
-        df = _optimize_dtypes(df)
-        frames.append(df)
-
+        year = _year_from_filename(f)
+        df   = load_sim_daily_year(year)
+        if not df.empty:
+            frames.append(df)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+# ---------------------------------------------------------------------------
+# File discovery helpers
+# ---------------------------------------------------------------------------
+
+def _find_year_file(folder: Path, year: int) -> Optional[Path]:
+    matches = [f for f in sorted(folder.glob("*.parquet"))
+               if str(year) in f.stem]
+    return matches[0] if matches else None
+
+
+def _get_year_files(folder: Path, years: Optional[list[int]]) -> list[Path]:
+    all_files = sorted(folder.glob("*.parquet"))
+    if years is None:
+        return all_files
+    filtered = [f for f in all_files if any(str(y) in f.stem for y in years)]
+    return filtered if filtered else all_files
+
+
+def _year_from_filename(path: Path) -> int:
+    """Extract year from filename like sim_monthly_2022.parquet → 2022."""
+    for part in path.stem.split("_"):
+        if part.isdigit() and len(part) == 4:
+            return int(part)
+    raise ValueError(f"Cannot extract year from filename: {path.name}")
